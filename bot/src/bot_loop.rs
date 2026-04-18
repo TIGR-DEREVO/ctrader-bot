@@ -165,6 +165,48 @@ pub async fn fetch_symbols(conn: &mut CTraderConnection, state: &Arc<AppState>) 
     }
 }
 
+/// Fetch the trader/account info and seed `AppState::account`. Called once
+/// after `fetch_symbols`. Placeholder equity/margin/freeMargin until we
+/// subscribe to ProtoOATraderUpdateEvent in a later PR.
+pub async fn fetch_trader(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
+    debug!("ProtoOaTraderReq");
+    let req = proto::ProtoOaTraderReq {
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaTraderReq as i32),
+        ctid_trader_account_id: state.account_id,
+    };
+    let envelope = wrap(proto::ProtoOaPayloadType::ProtoOaTraderReq as u32, &req);
+    conn.send(&envelope).await?;
+
+    loop {
+        let raw = conn.recv_raw().await?;
+        let msg = proto::ProtoMessage::decode(raw.as_slice())?;
+        if msg.payload_type == proto::ProtoOaPayloadType::ProtoOaTraderRes as u32 {
+            if let Some(ref payload) = msg.payload {
+                let res = proto::ProtoOaTraderRes::decode(payload.as_slice())?;
+                let money_digits = i32::from(res.trader.money_digits.unwrap_or(2) as i16);
+                let scale = 10f64.powi(money_digits);
+                let balance = res.trader.balance as f64 / scale;
+                let account = dto::Account {
+                    id: state.account_id.to_string(),
+                    balance,
+                    // Equity / margin / freeMargin aren't in TraderRes.
+                    // They arrive via ProtoOATraderUpdateEvent (later PR).
+                    equity: balance,
+                    margin: 0.0,
+                    free_margin: balance,
+                    // depositAssetId -> currency name needs ProtoOAAssetListReq.
+                    // Placeholder for now.
+                    currency: "USD".into(),
+                };
+                info!("Account fetched: balance={:.2}", balance);
+                *state.account.write().await = Some(account);
+            }
+            return Ok(());
+        }
+        handle_incoming(&msg, state, conn).await?;
+    }
+}
+
 pub async fn subscribe_to_spots(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
     let req = proto::ProtoOaSubscribeSpotsReq {
         payload_type: Some(proto::ProtoOaPayloadType::ProtoOaSubscribeSpotsReq as i32),
