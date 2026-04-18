@@ -49,11 +49,16 @@ impl Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ctrader_bot=debug".parse()?),
-        )
+    // fmt layer -> stdout (human or JSON depending on RUST_LOG).
+    // WsLogLayer -> WS /ws log channel, gated by the same EnvFilter.
+    // EnvFilter default: info for the world, debug for this crate.
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ctrader_bot=debug"));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(api::log_layer::WsLogLayer)
         .init();
 
     info!("Запуск cTrader Bot");
@@ -70,13 +75,19 @@ async fn main() -> Result<()> {
     // 2. Каналы и общий state
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (ws_tx, _) = broadcast::channel(1024);
+    // Wire the log layer to our ws channel so tracing events flow to WS.
+    api::log_layer::attach_sender(ws_tx.clone());
+
     let state = state::AppState::new(config.account_id, cmd_tx, ws_tx);
     state.set_status(state::STATUS_AUTHENTICATED);
 
     // 3. Symbol catalog (populates state.symbols so REST/WS can resolve names)
     bot_loop::fetch_symbols(&mut conn, &state).await?;
 
-    // 4. Initial reconcile + подписка на котировки (до запуска select!)
+    // 4. Trader / account info (seeds state.account for GET /api/account)
+    bot_loop::fetch_trader(&mut conn, &state).await?;
+
+    // 5. Initial reconcile + подписка на котировки (до запуска select!)
     bot_loop::initial_reconcile(&mut conn, &state).await?;
     bot_loop::subscribe_to_spots(&mut conn, &state).await?;
 
