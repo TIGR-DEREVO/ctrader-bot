@@ -64,9 +64,7 @@ pub async fn authenticate(conn: &mut CTraderConnection, config: &Config) -> Resu
     debug!("Шаг 1: авторизация приложения...");
 
     let app_auth_req = proto::ProtoOaApplicationAuthReq {
-        payload_type: Some(
-            proto::ProtoOaPayloadType::ProtoOaApplicationAuthReq as i32,
-        ),
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaApplicationAuthReq as i32),
         client_id: config.client_id.clone(),
         client_secret: config.client_secret.clone(),
     };
@@ -90,9 +88,7 @@ pub async fn authenticate(conn: &mut CTraderConnection, config: &Config) -> Resu
     debug!("Шаг 2: авторизация аккаунта {}...", config.account_id);
 
     let account_auth_req = proto::ProtoOaAccountAuthReq {
-        payload_type: Some(
-            proto::ProtoOaPayloadType::ProtoOaAccountAuthReq as i32,
-        ),
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaAccountAuthReq as i32),
         ctid_trader_account_id: config.account_id,
         access_token: config.access_token.clone(),
     };

@@ -70,8 +70,8 @@ impl CTraderConnection {
         trace!("Отправка {} байт", len);
 
         let mut frame = BytesMut::with_capacity(4 + body.len());
-        frame.put_u32(len);       // big-endian длина
-        frame.put_slice(&body);   // тело
+        frame.put_u32(len); // big-endian длина
+        frame.put_slice(&body); // тело
 
         self.stream.write_all(&frame).await?;
         Ok(())

@@ -9,7 +9,7 @@ use crate::connection::CTraderConnection;
 use crate::state::{
     f64_to_proto_volume, order_from_proto, parse_order_type, parse_side, position_from_proto,
     proto, proto_price_to_f64, AppState, BotCommand, BotEvent, PlaceOrderArgs, PlaceOrderResult,
-    Position, Quote, Tick, STATUS_CONNECTED, STATUS_DISCONNECTED,
+    Position, Quote, Tick, STATUS_DISCONNECTED,
 };
 use anyhow::Result;
 use prost::Message;
@@ -29,10 +29,7 @@ fn wrap(payload_type: u32, inner: &impl Message) -> proto::ProtoMessage {
 }
 
 /// Первоначальная синхронизация состояния: позиции и pending ордера.
-pub async fn initial_reconcile(
-    conn: &mut CTraderConnection,
-    state: &Arc<AppState>,
-) -> Result<()> {
+pub async fn initial_reconcile(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
     debug!("Запрос ProtoOAReconcileReq");
 
     let req = proto::ProtoOaReconcileReq {
@@ -68,10 +65,42 @@ pub async fn initial_reconcile(
     }
 }
 
-pub async fn subscribe_to_spots(
-    conn: &mut CTraderConnection,
-    state: &Arc<AppState>,
-) -> Result<()> {
+/// Fetch the full symbol list and populate `AppState::symbols`. Run once
+/// after authentication, before `subscribe_to_spots`, so the UI's symbol
+/// lookups never hit the fallback placeholder.
+pub async fn fetch_symbols(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
+    debug!("ProtoOaSymbolsListReq");
+    let req = proto::ProtoOaSymbolsListReq {
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaSymbolsListReq as i32),
+        ctid_trader_account_id: state.account_id,
+        include_archived_symbols: Some(false),
+    };
+    let envelope = wrap(
+        proto::ProtoOaPayloadType::ProtoOaSymbolsListReq as u32,
+        &req,
+    );
+    conn.send(&envelope).await?;
+
+    loop {
+        let raw = conn.recv_raw().await?;
+        let msg = proto::ProtoMessage::decode(raw.as_slice())?;
+        if msg.payload_type == proto::ProtoOaPayloadType::ProtoOaSymbolsListRes as u32 {
+            if let Some(ref payload) = msg.payload {
+                let res = proto::ProtoOaSymbolsListRes::decode(payload.as_slice())?;
+                let n = state.symbols.populate(
+                    res.symbol
+                        .iter()
+                        .filter_map(|s| s.symbol_name.as_deref().map(|n| (s.symbol_id, n))),
+                );
+                info!("Symbol catalog populated: {} entries", n);
+            }
+            return Ok(());
+        }
+        handle_incoming(&msg, state, conn).await?;
+    }
+}
+
+pub async fn subscribe_to_spots(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
     let req = proto::ProtoOaSubscribeSpotsReq {
         payload_type: Some(proto::ProtoOaPayloadType::ProtoOaSubscribeSpotsReq as i32),
         ctid_trader_account_id: state.account_id,
@@ -83,7 +112,10 @@ pub async fn subscribe_to_spots(
         &req,
     );
     conn.send(&envelope).await?;
-    info!("Подписка на spot events отправлена (symbol_id={})", SUBSCRIBE_SYMBOL_ID);
+    info!(
+        "Подписка на spot events отправлена (symbol_id={})",
+        SUBSCRIBE_SYMBOL_ID
+    );
     Ok(())
 }
 
@@ -93,9 +125,10 @@ pub async fn run(
     state: Arc<AppState>,
     mut cmd_rx: mpsc::Receiver<BotCommand>,
 ) -> Result<()> {
-    state.set_status(STATUS_CONNECTED);
+    // Status is set to AUTHENTICATED by main.rs after a successful account auth.
+    // We broadcast the transition here so WS subscribers learn about it.
     let _ = state.event_tx.send(BotEvent::ConnectionStatusChanged {
-        status: "connected".into(),
+        status: "authenticated".into(),
     });
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
@@ -217,7 +250,9 @@ async fn apply_execution(exec: &proto::ProtoOaExecutionEvent, state: &Arc<AppSta
     if let Some(pos) = exec.position.as_ref() {
         let updated = position_from_proto(pos);
         let mut positions = state.positions.write().await;
-        if let Some(existing) = positions.iter_mut().find(|p| p.position_id == updated.position_id)
+        if let Some(existing) = positions
+            .iter_mut()
+            .find(|p| p.position_id == updated.position_id)
         {
             *existing = updated;
         } else {
@@ -249,11 +284,7 @@ async fn apply_execution(exec: &proto::ProtoOaExecutionEvent, state: &Arc<AppSta
     }
 }
 
-async fn handle_command(
-    cmd: BotCommand,
-    state: &Arc<AppState>,
-    conn: &mut CTraderConnection,
-) {
+async fn handle_command(cmd: BotCommand, state: &Arc<AppState>, conn: &mut CTraderConnection) {
     match cmd {
         BotCommand::PlaceOrder { args, resp } => {
             let result = place_order(args, state, conn).await;

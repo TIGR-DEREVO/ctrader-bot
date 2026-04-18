@@ -1,3 +1,9 @@
+// prost-generated code contains idiomatic-for-protobuf patterns that clippy
+// objects to (enum_variant_names on ProtoOA*, large variants, etc.). Those
+// are upstream schema concerns, not ours.
+#![allow(clippy::enum_variant_names)]
+#![allow(clippy::large_enum_variant)]
+
 mod api;
 mod auth;
 mod bot_loop;
@@ -66,8 +72,12 @@ async fn main() -> Result<()> {
     let (tick_tx, _) = broadcast::channel(1024);
     let (event_tx, _) = broadcast::channel(256);
     let state = state::AppState::new(config.account_id, cmd_tx, tick_tx, event_tx);
+    state.set_status(state::STATUS_AUTHENTICATED);
 
-    // 3. Initial reconcile + подписка на котировки (до запуска select!)
+    // 3. Symbol catalog (populates state.symbols so REST/WS can resolve names)
+    bot_loop::fetch_symbols(&mut conn, &state).await?;
+
+    // 4. Initial reconcile + подписка на котировки (до запуска select!)
     bot_loop::initial_reconcile(&mut conn, &state).await?;
     bot_loop::subscribe_to_spots(&mut conn, &state).await?;
 
