@@ -1,0 +1,290 @@
+// state.rs — общее состояние бота.
+//
+// AppState хранит текущие котировки, позиции, статус соединения.
+// Каналы (broadcast/mpsc) связывают bot_loop с API слоем.
+
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/_.rs"));
+}
+
+// ── Статус соединения (AtomicU8) ──
+pub const STATUS_DISCONNECTED: u8 = 0;
+pub const STATUS_CONNECTING: u8 = 1;
+pub const STATUS_CONNECTED: u8 = 2;
+
+pub fn status_str(s: u8) -> &'static str {
+    match s {
+        STATUS_CONNECTED => "connected",
+        STATUS_CONNECTING => "connecting",
+        _ => "disconnected",
+    }
+}
+
+// ── Domain types (JSON) ──
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Quote {
+    pub symbol_id: i64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub timestamp_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Tick {
+    pub symbol_id: i64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub timestamp_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Position {
+    pub position_id: i64,
+    pub symbol_id: i64,
+    pub side: &'static str, // "BUY" / "SELL"
+    pub volume: f64,
+    pub entry_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub swap: f64,
+    pub commission: f64,
+    pub open_timestamp_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Order {
+    pub order_id: i64,
+    pub symbol_id: i64,
+    pub side: &'static str,
+    pub volume: f64,
+    pub order_type: &'static str,
+    pub status: &'static str,
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StatusInfo {
+    pub status: &'static str,
+    pub account_id: i64,
+    pub uptime_secs: u64,
+}
+
+// ── Команды из API в bot_loop ──
+
+#[derive(Debug, Deserialize)]
+pub struct PlaceOrderArgs {
+    pub symbol_id: i64,
+    pub side: String,       // "BUY" / "SELL"
+    pub order_type: String, // "MARKET" / "LIMIT" / "STOP"
+    pub volume: f64,        // в единицах инструмента
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaceOrderResult {
+    pub accepted: bool,
+    pub message: String,
+}
+
+pub enum BotCommand {
+    PlaceOrder {
+        args: PlaceOrderArgs,
+        resp: oneshot::Sender<Result<PlaceOrderResult, String>>,
+    },
+    CancelOrder {
+        order_id: i64,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+    ClosePosition {
+        position_id: i64,
+        volume: Option<f64>,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+// ── События из bot_loop в API ──
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BotEvent {
+    Execution {
+        execution_type: String,
+        position_id: Option<i64>,
+        order_id: Option<i64>,
+    },
+    OrderError {
+        error_code: String,
+        description: String,
+        order_id: Option<i64>,
+        position_id: Option<i64>,
+    },
+    ConnectionStatusChanged {
+        status: String,
+    },
+}
+
+// ── AppState ──
+
+pub struct AppState {
+    pub account_id: i64,
+    pub started_at: Instant,
+    pub connection_status: AtomicU8,
+
+    pub quotes: DashMap<i64, Quote>,
+    pub positions: RwLock<Vec<Position>>,
+    pub orders: RwLock<Vec<Order>>,
+
+    pub tick_tx: broadcast::Sender<Tick>,
+    pub event_tx: broadcast::Sender<BotEvent>,
+    pub cmd_tx: mpsc::Sender<BotCommand>,
+}
+
+impl AppState {
+    pub fn new(
+        account_id: i64,
+        cmd_tx: mpsc::Sender<BotCommand>,
+        tick_tx: broadcast::Sender<Tick>,
+        event_tx: broadcast::Sender<BotEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            account_id,
+            started_at: Instant::now(),
+            connection_status: AtomicU8::new(STATUS_CONNECTING),
+            quotes: DashMap::new(),
+            positions: RwLock::new(Vec::new()),
+            orders: RwLock::new(Vec::new()),
+            tick_tx,
+            event_tx,
+            cmd_tx,
+        })
+    }
+
+    pub fn set_status(&self, s: u8) {
+        self.connection_status.store(s, Ordering::Relaxed);
+    }
+
+    pub fn status(&self) -> u8 {
+        self.connection_status.load(Ordering::Relaxed)
+    }
+
+    pub fn status_info(&self) -> StatusInfo {
+        StatusInfo {
+            status: status_str(self.status()),
+            account_id: self.account_id,
+            uptime_secs: self.started_at.elapsed().as_secs(),
+        }
+    }
+}
+
+// ── Конвертация proto ↔ domain ──
+
+// cTrader цены: 1/100000 единицы
+pub fn proto_price_to_f64(v: u64) -> f64 {
+    v as f64 / 100_000.0
+}
+
+// cTrader volume: 0.01 единицы (cents)
+pub fn proto_volume_to_f64(v: i64) -> f64 {
+    v as f64 / 100.0
+}
+
+pub fn f64_to_proto_volume(v: f64) -> i64 {
+    (v * 100.0).round() as i64
+}
+
+pub fn side_str(s: i32) -> &'static str {
+    if s == proto::ProtoOaTradeSide::Buy as i32 {
+        "BUY"
+    } else {
+        "SELL"
+    }
+}
+
+pub fn parse_side(s: &str) -> Option<proto::ProtoOaTradeSide> {
+    match s.to_ascii_uppercase().as_str() {
+        "BUY" => Some(proto::ProtoOaTradeSide::Buy),
+        "SELL" => Some(proto::ProtoOaTradeSide::Sell),
+        _ => None,
+    }
+}
+
+pub fn parse_order_type(s: &str) -> Option<proto::ProtoOaOrderType> {
+    match s.to_ascii_uppercase().as_str() {
+        "MARKET" => Some(proto::ProtoOaOrderType::Market),
+        "LIMIT" => Some(proto::ProtoOaOrderType::Limit),
+        "STOP" => Some(proto::ProtoOaOrderType::Stop),
+        _ => None,
+    }
+}
+
+pub fn order_type_str(t: i32) -> &'static str {
+    if t == proto::ProtoOaOrderType::Market as i32 {
+        "MARKET"
+    } else if t == proto::ProtoOaOrderType::Limit as i32 {
+        "LIMIT"
+    } else if t == proto::ProtoOaOrderType::Stop as i32 {
+        "STOP"
+    } else if t == proto::ProtoOaOrderType::StopLimit as i32 {
+        "STOP_LIMIT"
+    } else if t == proto::ProtoOaOrderType::MarketRange as i32 {
+        "MARKET_RANGE"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+pub fn order_status_str(s: i32) -> &'static str {
+    if s == proto::ProtoOaOrderStatus::OrderStatusAccepted as i32 {
+        "ACCEPTED"
+    } else if s == proto::ProtoOaOrderStatus::OrderStatusFilled as i32 {
+        "FILLED"
+    } else if s == proto::ProtoOaOrderStatus::OrderStatusRejected as i32 {
+        "REJECTED"
+    } else if s == proto::ProtoOaOrderStatus::OrderStatusExpired as i32 {
+        "EXPIRED"
+    } else if s == proto::ProtoOaOrderStatus::OrderStatusCancelled as i32 {
+        "CANCELLED"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+pub fn position_from_proto(p: &proto::ProtoOaPosition) -> Position {
+    Position {
+        position_id: p.position_id,
+        symbol_id: p.trade_data.symbol_id,
+        side: side_str(p.trade_data.trade_side),
+        volume: proto_volume_to_f64(p.trade_data.volume),
+        entry_price: p.price,
+        stop_loss: p.stop_loss,
+        take_profit: p.take_profit,
+        swap: p.swap as f64 / 100.0,
+        commission: p.commission.map(|c| c as f64 / 100.0).unwrap_or(0.0),
+        open_timestamp_ms: p.trade_data.open_timestamp,
+    }
+}
+
+pub fn order_from_proto(o: &proto::ProtoOaOrder) -> Order {
+    Order {
+        order_id: o.order_id,
+        symbol_id: o.trade_data.symbol_id,
+        side: side_str(o.trade_data.trade_side),
+        volume: proto_volume_to_f64(o.trade_data.volume),
+        order_type: order_type_str(o.order_type),
+        status: order_status_str(o.order_status),
+        limit_price: o.limit_price,
+        stop_price: o.stop_price,
+    }
+}

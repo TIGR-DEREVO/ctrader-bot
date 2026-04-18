@@ -1,0 +1,53 @@
+[package]
+name = "ctrader-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ctrader-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS (без OpenSSL зависимостей — чисто Rust)
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-native-certs = "0.7"
+webpki-roots = "0.26"
+
+# Protobuf
+prost = "0.13"
+
+# Логирование и трейсинг
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Конфигурация из .env
+dotenvy = "0.15"
+
+# Обработка ошибок
+anyhow = "1"
+thiserror = "1"
+
+# Сериализация (для конфига)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Байтовые буферы
+bytes = "1"
+
+# HTTP/WS сервер
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Конкурентная мапа для state
+dashmap = "6"
+
+# Время
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+# Компиляция .proto файлов в Rust
+prost-build = "0.13"
