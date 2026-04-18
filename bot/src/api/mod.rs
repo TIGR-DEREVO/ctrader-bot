@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod dto;
+pub mod log_layer;
 pub mod routes;
 pub mod symbols;
 pub mod ws;
