@@ -8,7 +8,9 @@ use axum::{
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+pub mod dto;
 pub mod routes;
+pub mod symbols;
 pub mod ws;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
