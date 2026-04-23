@@ -20,7 +20,7 @@ use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const SUBSCRIBE_SYMBOL_ID: i64 = 1311; // ETHEREUM
 
@@ -357,8 +357,13 @@ async fn handle_incoming(
                 err.description.clone().unwrap_or_default()
             );
         }
+    } else if pt == proto::ProtoOaPayloadType::ProtoOaSubscribeSpotsRes as u32 {
+        // Async ack for `subscribe_to_spots` — empty body, nothing to do.
+        // Demoted from the `debug!` catch-all because this fires on every
+        // subscribe and only adds noise to an otherwise quiet info/debug feed.
+        trace!("SubscribeSpotsRes ack");
     } else {
-        debug!("Неизвестный payload_type={}", pt);
+        debug!(payload_type = pt, "unhandled inbound payload_type");
     }
 
     Ok(())
