@@ -214,6 +214,44 @@ impl ApiErrorBody {
     }
 }
 
+/// Per-symbol trading metadata, converted to UI-friendly units.
+///
+/// Volume fields are in the **same unit the UI submits in the order form**
+/// — i.e. `proto_volume_to_f64(cents) = cents / 100`. So for EURUSD on
+/// FxPro where minVolume is 100_000 cents:
+///
+///   UI input         = 1000.00  (displayed as "1000")
+///   API minVolume    = 1000.00
+///   bot → proto      = 100_000  (= 0.01 standard lot = 1000 EUR)
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolInfo {
+    pub symbol: String,
+    /// Price decimals (`ProtoOASymbol.digits`) — how to format bid/ask.
+    pub digits: u32,
+    /// Which decimal is the pip. 4 for FX majors, 2 for JPY pairs, etc.
+    pub pip_position: u32,
+    /// Smallest volume the broker will accept, in the UI's input unit.
+    pub min_volume: f64,
+    /// Volume tick — order volume must be a multiple of this.
+    pub step_volume: f64,
+    /// Largest volume the broker will accept.
+    pub max_volume: f64,
+}
+
+impl SymbolInfo {
+    pub fn from_catalog(name: String, meta: crate::api::symbols::SymbolMeta) -> Self {
+        SymbolInfo {
+            symbol: name,
+            digits: meta.digits,
+            pip_position: meta.pip_position,
+            min_volume: crate::state::proto_volume_to_f64(meta.min_volume),
+            step_volume: crate::state::proto_volume_to_f64(meta.step_volume),
+            max_volume: crate::state::proto_volume_to_f64(meta.max_volume),
+        }
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {

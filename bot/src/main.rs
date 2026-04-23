@@ -162,6 +162,17 @@ async fn main() -> Result<()> {
 
     // 5. Initial reconcile + подписка на котировки (до запуска select!)
     bot_loop::initial_reconcile(&mut conn, &state).await?;
+    // Hydrate per-symbol trading metadata (digits, min/step volume) for
+    // every subscribed symbol that we could resolve to an id. The UI
+    // uses these for order-form validation hints. Unknown names were
+    // already warned-about at parse; `fetch_symbol_details` no-ops if
+    // the list is empty.
+    let subscribe_ids: Vec<i64> = config
+        .subscribe_symbols
+        .iter()
+        .filter_map(|name| state.symbols.id(name))
+        .collect();
+    bot_loop::fetch_symbol_details(&mut conn, &state, &subscribe_ids).await?;
     bot_loop::subscribe_to_spots(&mut conn, &state, &config.subscribe_symbols).await?;
 
     // 4. Bot loop и API сервер в параллели
