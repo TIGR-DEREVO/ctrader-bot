@@ -22,8 +22,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-const SUBSCRIBE_SYMBOL_ID: i64 = 1311; // ETHEREUM
-
 fn wrap(payload_type: u32, inner: &impl Message) -> proto::ProtoMessage {
     proto::ProtoMessage {
         payload_type,
@@ -170,9 +168,54 @@ pub async fn fetch_symbols(conn: &mut CTraderConnection, state: &Arc<AppState>) 
 }
 
 /// Fetch the trader/account info and seed `AppState::account`. Called once
-/// after `fetch_symbols`. Placeholder equity/margin/freeMargin until we
-/// subscribe to ProtoOATraderUpdateEvent in a later PR.
+/// after `fetch_symbols`. Issues two reqs in sequence: `ProtoOaTraderReq`
+/// for the balance + deposit_asset_id, then `ProtoOaAssetListReq` to resolve
+/// that asset id into a human-readable currency code ("USD", "EUR", …).
+///
+/// Equity/margin/freeMargin still track `balance` here — they arrive live
+/// via `ProtoOATraderUpdateEvent` in a later PR.
 pub async fn fetch_trader(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
+    let trader = request_trader(conn, state).await?;
+    let money_digits = i32::from(trader.money_digits.unwrap_or(2) as i16);
+    let scale = 10f64.powi(money_digits);
+    let balance = trader.balance as f64 / scale;
+
+    let deposit_asset_id = trader.deposit_asset_id;
+    let currency = match fetch_asset_name(conn, state, deposit_asset_id).await? {
+        Some(name) => name,
+        None => {
+            warn!(
+                asset_id = deposit_asset_id,
+                "depositAssetId not found in asset list; falling back to 'USD'"
+            );
+            "USD".to_string()
+        }
+    };
+
+    let account = dto::Account {
+        id: state.account_id.to_string(),
+        balance,
+        equity: balance,
+        margin: 0.0,
+        free_margin: balance,
+        currency,
+    };
+    info!(
+        balance = format!("{:.2}", balance),
+        currency = %account.currency,
+        "Account fetched"
+    );
+    *state.account.write().await = Some(account);
+    Ok(())
+}
+
+/// Send ProtoOaTraderReq and drain the response. Messages received while
+/// waiting (e.g. late tick events) are dispatched through `handle_incoming`
+/// so we don't drop state updates that arrive mid-handshake.
+async fn request_trader(
+    conn: &mut CTraderConnection,
+    state: &Arc<AppState>,
+) -> Result<proto::ProtoOaTrader> {
     debug!("ProtoOaTraderReq");
     let req = proto::ProtoOaTraderReq {
         payload_type: Some(proto::ProtoOaPayloadType::ProtoOaTraderReq as i32),
@@ -187,35 +230,93 @@ pub async fn fetch_trader(conn: &mut CTraderConnection, state: &Arc<AppState>) -
         if msg.payload_type == proto::ProtoOaPayloadType::ProtoOaTraderRes as u32 {
             if let Some(ref payload) = msg.payload {
                 let res = proto::ProtoOaTraderRes::decode(payload.as_slice())?;
-                let money_digits = i32::from(res.trader.money_digits.unwrap_or(2) as i16);
-                let scale = 10f64.powi(money_digits);
-                let balance = res.trader.balance as f64 / scale;
-                let account = dto::Account {
-                    id: state.account_id.to_string(),
-                    balance,
-                    // Equity / margin / freeMargin aren't in TraderRes.
-                    // They arrive via ProtoOATraderUpdateEvent (later PR).
-                    equity: balance,
-                    margin: 0.0,
-                    free_margin: balance,
-                    // depositAssetId -> currency name needs ProtoOAAssetListReq.
-                    // Placeholder for now.
-                    currency: "USD".into(),
-                };
-                info!("Account fetched: balance={:.2}", balance);
-                *state.account.write().await = Some(account);
+                return Ok(res.trader);
             }
-            return Ok(());
+            anyhow::bail!("ProtoOaTraderRes без payload");
         }
         handle_incoming(&msg, state, conn).await?;
     }
 }
 
-pub async fn subscribe_to_spots(conn: &mut CTraderConnection, state: &Arc<AppState>) -> Result<()> {
+/// Look up the currency name for `asset_id` via ProtoOaAssetListReq.
+/// Returns `None` if the list doesn't contain that id (rare — broker
+/// config issue). Does NOT cache the full map: currency resolution only
+/// needs the one entry, and `depositAssetId` is stable for the account.
+async fn fetch_asset_name(
+    conn: &mut CTraderConnection,
+    state: &Arc<AppState>,
+    asset_id: i64,
+) -> Result<Option<String>> {
+    debug!("ProtoOaAssetListReq");
+    let req = proto::ProtoOaAssetListReq {
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaAssetListReq as i32),
+        ctid_trader_account_id: state.account_id,
+    };
+    let envelope = wrap(proto::ProtoOaPayloadType::ProtoOaAssetListReq as u32, &req);
+    conn.send(&envelope).await?;
+
+    loop {
+        let raw = conn.recv_raw().await?;
+        let msg = proto::ProtoMessage::decode(raw.as_slice())?;
+        if msg.payload_type == proto::ProtoOaPayloadType::ProtoOaAssetListRes as u32 {
+            if let Some(ref payload) = msg.payload {
+                let res = proto::ProtoOaAssetListRes::decode(payload.as_slice())?;
+                let found = res
+                    .asset
+                    .into_iter()
+                    .find(|a| a.asset_id == asset_id)
+                    .map(|a| a.name);
+                return Ok(found);
+            }
+            anyhow::bail!("ProtoOaAssetListRes без payload");
+        }
+        handle_incoming(&msg, state, conn).await?;
+    }
+}
+
+/// Subscribe to spot events for each of `symbol_names`. Names are resolved
+/// against the already-populated `SymbolCatalog`; unknown names are logged
+/// and skipped. Empty list is a valid no-op — bot still serves REST with
+/// no live ticks.
+pub async fn subscribe_to_spots(
+    conn: &mut CTraderConnection,
+    state: &Arc<AppState>,
+    symbol_names: &[String],
+) -> Result<()> {
+    if symbol_names.is_empty() {
+        warn!(
+            "CTRADER_SUBSCRIBE_SYMBOLS is empty — no spot subscriptions. \
+             Set it in .env (comma-separated symbol names) to stream live quotes."
+        );
+        return Ok(());
+    }
+
+    let mut resolved: Vec<i64> = Vec::with_capacity(symbol_names.len());
+    let mut resolved_names: Vec<&str> = Vec::with_capacity(symbol_names.len());
+    for name in symbol_names {
+        match state.symbols.id(name) {
+            Some(id) => {
+                resolved.push(id);
+                resolved_names.push(name);
+            }
+            None => {
+                warn!(
+                    symbol = %name,
+                    "CTRADER_SUBSCRIBE_SYMBOLS entry not in broker catalog; skipping"
+                );
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        warn!("no resolvable symbols in CTRADER_SUBSCRIBE_SYMBOLS — subscription skipped");
+        return Ok(());
+    }
+
     let req = proto::ProtoOaSubscribeSpotsReq {
         payload_type: Some(proto::ProtoOaPayloadType::ProtoOaSubscribeSpotsReq as i32),
         ctid_trader_account_id: state.account_id,
-        symbol_id: vec![SUBSCRIBE_SYMBOL_ID],
+        symbol_id: resolved.clone(),
         subscribe_to_spot_timestamp: Some(true),
     };
     let envelope = wrap(
@@ -224,8 +325,9 @@ pub async fn subscribe_to_spots(conn: &mut CTraderConnection, state: &Arc<AppSta
     );
     conn.send(&envelope).await?;
     info!(
-        "Подписка на spot events отправлена (symbol_id={})",
-        SUBSCRIBE_SYMBOL_ID
+        symbols = ?resolved_names,
+        ids = ?resolved,
+        "spot subscription sent"
     );
     Ok(())
 }
