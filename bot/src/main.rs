@@ -10,9 +10,6 @@ mod bot_loop;
 mod connection;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 use anyhow::Result;
 use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc};
@@ -43,6 +40,11 @@ pub struct Config {
     pub host: String, // demo.ctraderapi.com или live.ctraderapi.com
     pub port: u16,    // 5035
     pub api_addr: SocketAddr,
+    /// Symbol names (catalog keys, not IDs) to subscribe to spot events for
+    /// at startup. Comma-separated in the env var; whitespace tolerated:
+    ///     CTRADER_SUBSCRIBE_SYMBOLS=EURUSD,ETHEREUM, GBPJPY
+    /// Empty = no subscriptions (bot still serves REST, just no live ticks).
+    pub subscribe_symbols: Vec<String>,
 }
 
 impl Config {
@@ -54,6 +56,9 @@ impl Config {
         let refresh_token = std::env::var("CTRADER_REFRESH_TOKEN")
             .ok()
             .filter(|v| !v.is_empty() && v != "your_refresh_token_here");
+        let subscribe_symbols = parse_symbol_list(
+            &std::env::var("CTRADER_SUBSCRIBE_SYMBOLS").unwrap_or_default(),
+        );
         Ok(Self {
             client_id: std::env::var("CTRADER_CLIENT_ID")?,
             client_secret: std::env::var("CTRADER_CLIENT_SECRET")?,
@@ -68,8 +73,24 @@ impl Config {
             api_addr: std::env::var("API_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3000".to_string())
                 .parse()?,
+            subscribe_symbols,
         })
     }
+}
+
+/// Parse `CTRADER_SUBSCRIBE_SYMBOLS` into a de-duplicated, whitespace-trimmed,
+/// upper-cased list. Empty fragments are dropped so a trailing comma
+/// ("EURUSD,") doesn't become `[..., ""]`. Order is preserved — dedup keeps
+/// the first occurrence.
+fn parse_symbol_list(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim().to_ascii_uppercase();
+        if !name.is_empty() && !out.iter().any(|existing| existing == &name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 #[tokio::main]
@@ -141,7 +162,7 @@ async fn main() -> Result<()> {
 
     // 5. Initial reconcile + подписка на котировки (до запуска select!)
     bot_loop::initial_reconcile(&mut conn, &state).await?;
-    bot_loop::subscribe_to_spots(&mut conn, &state).await?;
+    bot_loop::subscribe_to_spots(&mut conn, &state, &config.subscribe_symbols).await?;
 
     // 4. Bot loop и API сервер в параллели
     let state_for_api = state.clone();
@@ -172,4 +193,50 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod config_tests {
+    use super::parse_symbol_list;
+
+    #[test]
+    fn parses_comma_separated_list() {
+        assert_eq!(
+            parse_symbol_list("EURUSD,ETHEREUM,GBPJPY"),
+            vec!["EURUSD", "ETHEREUM", "GBPJPY"]
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_and_uppercases() {
+        assert_eq!(
+            parse_symbol_list(" eurusd ,  ETHEREUM , gbpjpy"),
+            vec!["EURUSD", "ETHEREUM", "GBPJPY"]
+        );
+    }
+
+    #[test]
+    fn drops_empty_fragments() {
+        assert_eq!(
+            parse_symbol_list(",EURUSD,,ETHEREUM,"),
+            vec!["EURUSD", "ETHEREUM"]
+        );
+    }
+
+    #[test]
+    fn dedupes_preserving_first_occurrence() {
+        assert_eq!(
+            parse_symbol_list("EURUSD,ethereum,EURUSD"),
+            vec!["EURUSD", "ETHEREUM"]
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(parse_symbol_list("").is_empty());
+        assert!(parse_symbol_list("   ").is_empty());
+    }
 }
