@@ -11,6 +11,16 @@ use tokio::sync::oneshot;
 use crate::api::dto;
 use crate::state::{AppState, BotCommand};
 
+/// Convenience constructor for a JSON error envelope matching the UI's
+/// `ApiError` parser (`{ error: { code, message } }`).
+fn api_err(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> (StatusCode, Json<dto::ApiErrorBody>) {
+    (status, Json(dto::ApiErrorBody::new(code, message)))
+}
+
 pub async fn list_positions(State(state): State<Arc<AppState>>) -> Json<Vec<dto::Position>> {
     let positions = state.positions.read().await;
     let out: Vec<dto::Position> = positions
@@ -30,10 +40,14 @@ pub async fn close_position(
     State(state): State<Arc<AppState>>,
     Path(position_id_str): Path<String>,
     body: Option<Json<CloseBody>>,
-) -> Result<Json<dto::Position>, (StatusCode, String)> {
-    let position_id: i64 = position_id_str
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid position id".into()))?;
+) -> Result<Json<dto::Position>, (StatusCode, Json<dto::ApiErrorBody>)> {
+    let position_id: i64 = position_id_str.parse().map_err(|_| {
+        api_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_position_id",
+            "invalid position id",
+        )
+    })?;
 
     let volume = body.and_then(|b| b.0.volume);
     let (tx, rx) = oneshot::channel();
@@ -45,7 +59,13 @@ pub async fn close_position(
             resp: tx,
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bot_channel_closed",
+                e.to_string(),
+            )
+        })?;
 
     match rx.await {
         Ok(Ok(())) => {
@@ -56,16 +76,18 @@ pub async fn close_position(
             let found = positions.iter().find(|p| p.position_id == position_id);
             match found {
                 Some(p) => Ok(Json(dto::Position::from_state(p, &state.symbols))),
-                None => Err((
+                None => Err(api_err(
                     StatusCode::NOT_FOUND,
+                    "position_not_found",
                     format!("position {position_id} not found after close request"),
                 )),
             }
         }
-        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
-        Err(_) => Err((
+        Ok(Err(e)) => Err(api_err(StatusCode::BAD_REQUEST, "close_rejected", e)),
+        Err(_) => Err(api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "bot loop dropped response".into(),
+            "bot_channel_dropped",
+            "bot loop dropped response",
         )),
     }
 }

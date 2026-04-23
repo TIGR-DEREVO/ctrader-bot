@@ -267,25 +267,94 @@ async fn post_orders_rejects_unknown_fields() {
 #[tokio::test]
 async fn post_orders_accepted_by_mocked_bot_loop() {
     // Spawn a minimal fake bot-loop consumer to unblock the POST roundtrip.
+    // It ALSO pushes the resulting Order into state right after sending the
+    // accept, modelling the real bot_loop's behaviour where the broker's
+    // ExecutionEvent lands the Order in state a few ms after acceptance.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<BotCommand>(8);
     let (ws_tx, _) = broadcast::channel::<dto::WsFrame>(16);
     let state = AppState::new(42, cmd_tx, ws_tx);
     state.symbols.populate([(1, "EURUSD")]);
-    // Pretend the placed order is already in state so the route can echo it.
-    state.orders.write().await.push(Order {
-        order_id: 99,
-        symbol_id: 1,
-        side: "BUY",
-        volume: 0.1,
-        order_type: "MARKET",
-        status: "ACCEPTED",
-        limit_price: None,
-        stop_price: None,
-        stop_loss: None,
-        take_profit: None,
-        created_at_ms: Some(0),
+    let state_for_bot = state.clone();
+
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let BotCommand::PlaceOrder { resp, .. } = cmd {
+                let _ = resp.send(Ok(crate::state::PlaceOrderResult {
+                    accepted: true,
+                    message: "ok".into(),
+                }));
+                // Simulate the ExecutionEvent pushing the concrete Order.
+                state_for_bot.orders.write().await.push(Order {
+                    order_id: 99,
+                    symbol_id: 1,
+                    side: "BUY",
+                    volume: 0.1,
+                    order_type: "MARKET",
+                    status: "FILLED",
+                    limit_price: None,
+                    stop_price: None,
+                    stop_loss: None,
+                    take_profit: None,
+                    created_at_ms: Some(0),
+                });
+            }
+        }
     });
 
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/orders")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"symbol":"EURUSD","side":"buy","kind":"market","volume":0.1}"#,
+        ))
+        .unwrap();
+    // Give the mocked handler room to respond even on slow CI.
+    let resp = tokio::time::timeout(Duration::from_secs(2), app(state).oneshot(req))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_orders_error_returns_json_envelope() {
+    // Regression guard for the "Unexpected token 'o'" bug: before the fix,
+    // the error path returned plain-text bodies that UI clients couldn't
+    // parse as JSON, so real broker rejections surfaced as generic parse
+    // errors. Every 4xx/5xx must now be a `{ error: { code, message } }`
+    // envelope.
+    let state = seeded_state();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/orders")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"symbol":"DOES_NOT_EXIST","side":"buy","kind":"market","volume":0.1}"#,
+        ))
+        .unwrap();
+    let (status, body) = body_json(app(state), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.get("error").is_some(),
+        "error response must have `error` envelope, got: {body}"
+    );
+    let err = &body["error"];
+    assert!(err.get("code").and_then(|v| v.as_str()).is_some());
+    assert!(err.get("message").and_then(|v| v.as_str()).is_some());
+}
+
+#[tokio::test]
+async fn post_orders_pending_execution_returns_json_envelope() {
+    // When the bot accepts but no ExecutionEvent lands within the poll
+    // window, we now surface 202 ACCEPTED + a `pending_execution` error
+    // envelope instead of the old plain-text 202 that crashed UI parsing.
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<BotCommand>(8);
+    let (ws_tx, _) = broadcast::channel::<dto::WsFrame>(16);
+    let state = AppState::new(42, cmd_tx, ws_tx);
+    state.symbols.populate([(1, "EURUSD")]);
+
+    // Bot-loop mock that accepts but NEVER pushes the Order into state.
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             if let BotCommand::PlaceOrder { resp, .. } = cmd {
@@ -305,12 +374,24 @@ async fn post_orders_accepted_by_mocked_bot_loop() {
             r#"{"symbol":"EURUSD","side":"buy","kind":"market","volume":0.1}"#,
         ))
         .unwrap();
-    // Give the mocked handler room to respond even on slow CI.
-    let resp = tokio::time::timeout(Duration::from_secs(2), app(state).oneshot(req))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Generous timeout — the handler itself waits ~1.2 s for the order to
+    // appear before giving up.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async move {
+            let resp = app(state).oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, v)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["error"]["code"], "pending_execution");
 }
 
 #[test]
