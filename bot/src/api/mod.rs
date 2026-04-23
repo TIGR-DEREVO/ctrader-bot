@@ -25,6 +25,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/status", get(routes::status::get_status))
         .route("/api/account", get(routes::account::get_account))
         .route("/api/quotes", get(routes::quotes::get_quotes))
+        .route("/api/symbols", get(routes::symbols::list_symbols))
         .route("/api/positions", get(routes::positions::list_positions))
         .route(
             "/api/positions/:id/close",

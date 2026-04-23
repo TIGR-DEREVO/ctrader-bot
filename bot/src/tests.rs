@@ -401,6 +401,42 @@ fn trades_capacity_is_five_thousand() {
 }
 
 #[tokio::test]
+async fn get_symbols_returns_hydrated_entries_only() {
+    use crate::api::symbols::SymbolMeta;
+
+    let state = seeded_state();
+    // seeded_state populates EURUSD (id 1) and GBPUSD (id 2). Attach
+    // metadata only for EURUSD — the route should omit GBPUSD since we
+    // can't sensibly validate volume against it yet.
+    state.symbols.put_meta(
+        1,
+        SymbolMeta {
+            digits: 5,
+            pip_position: 4,
+            min_volume: 100_000, // cents → 1000.00 base units
+            step_volume: 10_000, // cents → 100.00
+            max_volume: 10_000_000,
+        },
+    );
+
+    let req = Request::builder()
+        .uri("/api/symbols")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = body_json(app(state), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = body.as_array().expect("symbols response must be array");
+    assert_eq!(arr.len(), 1, "only EURUSD has meta");
+    let s = &arr[0];
+    assert_eq!(s["symbol"], "EURUSD");
+    assert_eq!(s["digits"], 5);
+    assert_eq!(s["pipPosition"], 4);
+    // Volumes are in the UI input unit (= proto cents / 100).
+    assert_eq!(s["minVolume"], 1000.0);
+    assert_eq!(s["stepVolume"], 100.0);
+}
+
+#[tokio::test]
 async fn get_metrics_returns_prometheus_text() {
     // The recorder is a global — in the test harness we don't install it
     // (tests share a process, and re-installing panics). The handler

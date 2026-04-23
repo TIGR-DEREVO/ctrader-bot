@@ -274,6 +274,62 @@ async fn fetch_asset_name(
     }
 }
 
+/// Fetch trading metadata (digits, pip position, min/step/max volume)
+/// for the given symbol IDs via `ProtoOaSymbolByIdReq` and stash it on
+/// the catalog. The UI uses these to validate the order form before the
+/// broker gets a chance to reject on business rules.
+///
+/// Issued in a single batched request — the proto field is `repeated
+/// int64 symbolId`, so there's no per-symbol round trip. Empty input is
+/// a valid no-op.
+pub async fn fetch_symbol_details(
+    conn: &mut CTraderConnection,
+    state: &Arc<AppState>,
+    symbol_ids: &[i64],
+) -> Result<()> {
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+    debug!(count = symbol_ids.len(), "ProtoOaSymbolByIdReq");
+    let req = proto::ProtoOaSymbolByIdReq {
+        payload_type: Some(proto::ProtoOaPayloadType::ProtoOaSymbolByIdReq as i32),
+        ctid_trader_account_id: state.account_id,
+        symbol_id: symbol_ids.to_vec(),
+    };
+    let envelope = wrap(
+        proto::ProtoOaPayloadType::ProtoOaSymbolByIdReq as u32,
+        &req,
+    );
+    conn.send(&envelope).await?;
+
+    loop {
+        let raw = conn.recv_raw().await?;
+        let msg = proto::ProtoMessage::decode(raw.as_slice())?;
+        if msg.payload_type == proto::ProtoOaPayloadType::ProtoOaSymbolByIdRes as u32 {
+            if let Some(ref payload) = msg.payload {
+                let res = proto::ProtoOaSymbolByIdRes::decode(payload.as_slice())?;
+                let mut hydrated = 0usize;
+                for s in &res.symbol {
+                    // All fields below are `optional` in the proto; fall
+                    // back to sensible safe values if the broker omits any.
+                    let meta = crate::api::symbols::SymbolMeta {
+                        digits: s.digits as u32,
+                        pip_position: s.pip_position as u32,
+                        min_volume: s.min_volume.unwrap_or(0),
+                        step_volume: s.step_volume.unwrap_or(0),
+                        max_volume: s.max_volume.unwrap_or(0),
+                    };
+                    state.symbols.put_meta(s.symbol_id, meta);
+                    hydrated += 1;
+                }
+                info!(hydrated, "symbol metadata fetched");
+            }
+            return Ok(());
+        }
+        handle_incoming(&msg, state, conn).await?;
+    }
+}
+
 /// Subscribe to spot events for each of `symbol_names`. Names are resolved
 /// against the already-populated `SymbolCatalog`; unknown names are logged
 /// and skipped. Empty list is a valid no-op — bot still serves REST with
